@@ -16,6 +16,7 @@ import json
 
 from database import SessionLocal, engine, Base
 from models import RecipeLink
+from ai_dish import needs_ai, ai_refine_dish_name
 
 # =========================
 # App
@@ -209,26 +210,69 @@ _NOISE_WORDS = [
     "プロの", "定番", "料理", "キッチン",
 ]
 
-_SPLIT_SEP_RE = re.compile(r"\s*(?:[｜|]|[-–—]|:|：|／|/)\s*")
+_SPLIT_SEP_RE = re.compile(r"\s*(?:[｜|]|[-–—])\s*")
 
 _TAIL_RE = re.compile(
-    r"\s*(?:by\s+\S+|By\s+\S+|【[^】]{1,40}】|\([^)]{1,40}\)|（[^）]{1,40}）)\s*$"
+    r"\s*(?:by\s+\S+|By\s+\S+|\([^)]{1,40}\)|（[^）]{1,40}）)\s*$"
 )
 
 def clean_dish_title(raw: str) -> Optional[str]:
     if not raw:
         return None
 
-    s = re.sub(r"\s+", " ", (raw or "")).strip()
-    if not s:
+    s0 = re.sub(r"\s+", " ", (raw or "")).strip()
+    if not s0:
         return None
 
-    # まず「右側に付くサイト名」を切る
-    s = _SPLIT_SEP_RE.split(s)[0].strip()
+    s = s0
 
-    # 末尾の括弧系を軽く複数回落とす
+    # まず「右側に付くサイト名」を切る（区切りがある時だけ）
+    parts = _SPLIT_SEP_RE.split(s)
+
+    # 長すぎる場合だけ分割を使う
+    if parts and len(parts[0]) >= 3:
+      s = parts[0].strip()
+
+    # 末尾の括弧系を軽く複数回落とす（ただし # は残したいのでここでは触らない）
     for _ in range(2):
         ns = _TAIL_RE.sub("", s).strip()
+        if ns == s:
+            break
+        s = ns
+
+    # -------------------------
+    # 末尾の【...】を“内容で選別”
+    # -------------------------
+    def _strip_bracket_tail_by_policy(text: str) -> str:
+        m = re.search(r"(.*?)(【([^】]+)】)\s*$", text)
+        if not m:
+            return text
+
+        body = (m.group(3) or "").strip()
+
+        # 宣伝・サイト寄り → 落とす
+        promo_words = [
+          "人気", "おすすめ", "殿堂", "話題", "失敗なし", "公式",
+          "人気レシピ", "鉄板", "保存版", "ランキング", "1位", "No.1"
+        ]
+        # 宣伝・サイト寄り → 落とす（ただし短い情報は残す）
+        if any(w in body for w in promo_words) and len(body) >= 15:
+          return (m.group(1) or "").strip()
+
+        # 調理情報（残したい）→ 残す
+        keep_words = [
+            "レンジ", "電子レンジ", "フライパン", "鍋", "炊飯器", "トースター",
+            "めんつゆ", "時短", "とろみ", "不要", "作り置き", "お弁当"
+        ]
+        if any(w in body for w in keep_words):
+            return text
+
+        # どっちとも言えない【...】は一旦残す（削りすぎ防止）
+        return text
+
+    # 最大2回（【】【】みたいな連結対策）
+    for _ in range(2):
+        ns = _strip_bracket_tail_by_policy(s)
         if ns == s:
             break
         s = ns
@@ -244,15 +288,23 @@ def clean_dish_title(raw: str) -> Optional[str]:
         s = re.sub(rf"^{re.escape(w)}\s*", "", s).strip()
         s = re.sub(rf"\s*{re.escape(w)}$", "", s).strip()
 
-    # 末尾に付きがちな「〜さん」「〜のレシピ」系を雑に削る（破壊しすぎない程度）
+    # 末尾に付きがちな敬称だけ削る（タイトル要素は残す）
     s = re.sub(r"\s+(さん|ちゃん|くん|氏)$", "", s).strip()
 
-    # 記号整理
+    # 記号整理（#は残したいので削らない）
     s = s.strip(" -–—|｜:：/／").strip()
 
-    if 2 <= len(s) <= 60:
+    # -------------------------
+    # 安全弁：削りすぎたら戻す
+    # -------------------------
+    if len(s) < 2:
+        # 元の候補から最低限だけ整えて返す
+        fallback = s0.strip().strip(" -–—|｜:：/／").strip()
+        return fallback if (2 <= len(fallback) <= 80) else None
+
+    if 2 <= len(s) <= 80:
         return s
-    return None
+    return s[:80].strip() if s else None
 
 
 def extract_recipe_name_from_jsonld(html: str) -> Optional[str]:
@@ -288,6 +340,30 @@ def extract_recipe_name_from_jsonld(html: str) -> Optional[str]:
                     return name.strip()
 
     return None
+
+def extract_h1_title(html: str) -> Optional[str]:
+    """
+    ページ上部の太字タイトル（だいたいH1）を抜く。
+    タグや改行を潰して文字だけにする。
+    """
+    if not html:
+        return None
+
+    m = re.search(r"<h1\b[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+
+    t = m.group(1) or ""
+    # H1内のタグ除去
+    t = re.sub(r"<[^>]+>", "", t)
+    # HTMLエンティティの最低限（必要なら増やす）
+    t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    t = re.sub(r"\s+", " ", t).strip()
+
+    if 2 <= len(t) <= 120:
+        return t
+    return None
+
 
 
 def extract_og_or_title(html: str) -> Optional[str]:
@@ -336,7 +412,7 @@ def extract_og_or_title(html: str) -> Optional[str]:
 # =========================
 # Dish name (JSON-LD -> og:title -> <title>)
 # =========================
-@lru_cache(maxsize=512)
+#@lru_cache(maxsize=512)
 def get_og_title(page_url: str) -> Optional[str]:
     if not page_url:
         return None
@@ -362,19 +438,24 @@ def get_og_title(page_url: str) -> Optional[str]:
         # 1) JSON-LD (Recipe.name)
         title = extract_recipe_name_from_jsonld(html)
 
-        # 2) OGP / twitter / title
+        # 2) H1（画面の太字タイトルを優先）
+        if not title:
+            title = extract_h1_title(html)
+
+        # 3) OGP / twitter / <title>
         if not title:
             title = extract_og_or_title(html)
 
-        # 3) Clean
+        # 4) Clean（削りすぎ防止あり）
         cleaned = clean_dish_title(title or "")
         if cleaned:
             return cleaned
 
-        # fallback
-        title = (title or "").strip()
-        if 2 <= len(title) <= 80:
-            return title
+        # 5) fallback（空になるのを防ぐ）
+        fallback = (title or "").strip()
+        if 2 <= len(fallback) <= 120:
+            return fallback
+
         return None
 
     except Exception:
@@ -396,9 +477,15 @@ def guess_category_from_text(text: str) -> str:
     if any(k in t for k in ["パン", "トースト", "サンド", "ホットサンド"]):
         return "パン"
 
-    if any(k in t for k in ["ケーキ", "プリン", "パフェ", "タルト", "アイス", "ブラウニー", "クレープ"]):
+    if any(k in t for k in ["ケーキ", "プリン", "パフェ", "タルト", "アイス", "ブラウニー", "クレープ", "ゼリー", "ムース", "羊羹", "ようかん"]):
         return "スイーツ"
-    if any(k in t for k in ["クッキー", "ドーナツ", "マフィン", "スコーン", "おやつ"]):
+    if any(k in t for k in [
+        "クッキー", "ドーナツ", "マフィン", "スコーン",
+        "ポテチ", "ポテトチップス", "スナック", "チップス",
+        "おやつ", "駄菓子", "お菓子",
+        "せんべい", "煎餅", "あられ",
+        "ナッツ", "グミ", "キャンディ", "飴", "チョコ"
+    ]):
         return "おやつ"
 
     if any(k in t for k in ["スープ", "味噌汁", "みそ汁", "ポタージュ", "シチュー"]):
@@ -436,7 +523,6 @@ def meta(url: str = Query(...)):
     title = get_og_title(url)
     suggested = guess_category_from_text(title or "")
     return JSONResponse({"title": title, "category": suggested})
-
 
 # =========================
 # UI
@@ -525,7 +611,10 @@ def index(
                   <input value="{h(it.url)}" disabled>
                 </label>
                 <label>料理名
-                  <input name="title" value="{h(it.title)}" required>
+                  <div class="row">
+                    <input id="dishInput" name="title" value="{h(prefill_title or '')}" required placeholder="例：ぶり大根">
+                    <button type="button" id="clearBtn" class="iconbtn" aria-label="料理名をクリア">×</button>
+                  </div>
                 </label>
                 <label>カテゴリ
                   <input name="category" value="{h(it.category)}" required>
@@ -914,7 +1003,10 @@ def index(
       -webkit-tap-highlight-color: transparent;
     }}
 
-    body.noscroll {{ overflow: hidden; }}
+    body.noscroll {{
+      overflow: hidden;
+      touch-action: none;
+    }}
 
     /* PCデバッグ用（普段は見えない） */
     .editbox {{
@@ -945,6 +1037,63 @@ def index(
       color: var(--muted);
       font-weight: 700;
     }}
+
+    .row {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }}
+
+    .row input {{
+      flex: 1 1 auto;
+      min-width: 0;
+    }}
+
+    .iconbtn {{
+      flex: 0 0 44px;
+      width: 44px;
+      height: 44px;
+      border-radius: 999px;
+      border: 1px solid rgba(31,36,48,.14);
+      background: rgba(255,255,255,.92);
+      font-size: 22px;
+      font-weight: 900;
+      line-height: 1;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      -webkit-tap-highlight-color: transparent;
+    }}
+
+    .iconbtn:active {{
+      transform: scale(.98);
+    }}
+
+    .dishrow {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }}
+
+    .sheetform textarea {{
+      width: 100%;
+      padding: 14px 14px;
+      border: 1px solid rgba(31,36,48,.16);
+      border-radius: 16px;
+      outline: none;
+      background: rgba(255,255,255,.96);
+      transition: box-shadow .15s ease, border-color .15s ease, transform .08s ease;
+      resize: none;
+    }}
+
+    .sheetform textarea:focus {{
+      border-color: rgba(255,95,162,.55);
+      box-shadow: 0 0 0 4px rgba(255,95,162,.16);
+      transform: translateY(-1px);
+    }}
+
+
   </style>
 </head>
 
@@ -989,7 +1138,10 @@ def index(
         </label>
 
         <label>料理名
-          <input id="dishInput" name="title" value="{h(prefill_title or '')}" required placeholder="例：ぶり大根">
+          <div class="dishrow">
+            <textarea id="dishInput" name="title" rows="2" required placeholder="例：ぶり大根">{h(prefill_title or '')}</textarea>
+            <button type="button" id="clearBtn" class="iconbtn" aria-label="入力をリセット">↺</button>
+          </div>
         </label>
 
         <label>カテゴリ
@@ -1000,7 +1152,7 @@ def index(
         </label>
 
         <div class="tiny">※URLを入れると料理名とカテゴリ候補を出すよ（外れたらタップで変更）</div>
-
+        
         <button type="submit" class="sheetSave">保存する ✨</button>
       </form>
     </div>
@@ -1017,6 +1169,23 @@ def index(
     const closeBtn = document.getElementById("sheetClose");
     const urlInput = document.getElementById("urlInput");
     const dishInput = document.getElementById("dishInput");
+
+
+    const clearBtn = document.getElementById("clearBtn");
+
+    if (clearBtn) {{
+      clearBtn.addEventListener("click", () => {{
+        urlInput.value = "";
+        dishInput.value = "";
+        prevUrl = "";
+        lastUrl = "";
+        userTouchedCategory = false;
+        setCategory("{h(DEFAULT_CATEGORY)}", false);
+        urlInput.focus();
+      }});
+    }}
+
+
 
     const chipGrid = document.getElementById("chipGrid");
     const catValue = document.getElementById("catValue");
@@ -1048,6 +1217,8 @@ def index(
     if (!catValue.value) {{
       setCategory("{h(DEFAULT_CATEGORY)}", false);
     }}
+
+    let scrollY = 0;
 
     function openSheet() {{
       sheet.classList.add("open");
@@ -1113,7 +1284,22 @@ def index(
       }}, 350);
     }}
 
-    urlInput.addEventListener("input", scheduleMetaFetch);
+    let prevUrl = "";
+
+
+
+    urlInput.addEventListener("input", (e) => {{
+      const u = (urlInput.value || "").trim();
+
+      // URLが変わったら料理名リセット
+      if (u !== prevUrl) {{
+        dishInput.value = "";
+        prevUrl = u;
+      }}
+
+      scheduleMetaFetch();
+    }});
+
     urlInput.addEventListener("blur", scheduleMetaFetch);
 
     window.addEventListener("load", () => {{
