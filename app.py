@@ -54,7 +54,7 @@ CATEGORIES: List[Dict[str, str]] = [
     {"key": "スープ", "emoji": "🍲"},
     {"key": "朝ごはん", "emoji": "🌅"},
     {"key": "お弁当", "emoji": "🍱"},
-    {"key": "作り置き", "emoji": "🧊"},
+   
     {"key": "おつまみ", "emoji": "🍺"},
     {"key": "スイーツ", "emoji": "🍰"},
     {"key": "おやつ", "emoji": "🍪"},
@@ -686,7 +686,7 @@ def index(
     .wrap {{
       max-width: 430px;
       margin: 0 auto;
-      padding: 14px 14px 110px;
+      padding: 22px 14px 110px;  /* ← 14px → 22px に増やす */
     }}
 
     input, select, button {{ font-size: 16px; }}
