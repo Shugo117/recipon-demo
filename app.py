@@ -365,7 +365,6 @@ def extract_h1_title(html: str) -> Optional[str]:
     return None
 
 
-
 def extract_og_or_title(html: str) -> Optional[str]:
     # og:title
     m = re.search(
@@ -412,7 +411,6 @@ def extract_og_or_title(html: str) -> Optional[str]:
 # =========================
 # Dish name (JSON-LD -> og:title -> <title>)
 # =========================
-#@lru_cache(maxsize=512)
 def get_og_title(page_url: str) -> Optional[str]:
     if not page_url:
         return None
@@ -1092,8 +1090,6 @@ def index(
       box-shadow: 0 0 0 4px rgba(255,95,162,.16);
       transform: translateY(-1px);
     }}
-
-
   </style>
 </head>
 
@@ -1152,7 +1148,7 @@ def index(
         </label>
 
         <div class="tiny">※URLを入れると料理名とカテゴリ候補を出すよ（外れたらタップで変更）</div>
-        
+
         <button type="submit" class="sheetSave">保存する ✨</button>
       </form>
     </div>
@@ -1170,7 +1166,6 @@ def index(
     const urlInput = document.getElementById("urlInput");
     const dishInput = document.getElementById("dishInput");
 
-
     const clearBtn = document.getElementById("clearBtn");
 
     if (clearBtn) {{
@@ -1184,8 +1179,6 @@ def index(
         urlInput.focus();
       }});
     }}
-
-
 
     const chipGrid = document.getElementById("chipGrid");
     const catValue = document.getElementById("catValue");
@@ -1217,8 +1210,6 @@ def index(
     if (!catValue.value) {{
       setCategory("{h(DEFAULT_CATEGORY)}", false);
     }}
-
-    let scrollY = 0;
 
     function openSheet() {{
       sheet.classList.add("open");
@@ -1285,8 +1276,6 @@ def index(
     }}
 
     let prevUrl = "";
-
-
 
     urlInput.addEventListener("input", (e) => {{
       const u = (urlInput.value || "").trim();
