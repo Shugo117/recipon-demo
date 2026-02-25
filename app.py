@@ -1090,6 +1090,14 @@ def index(
       box-shadow: 0 0 0 4px rgba(255,95,162,.16);
       transform: translateY(-1px);
     }}
+
+    .stickySave {{
+      position: sticky;
+      bottom: 12px;
+      z-index: 10;
+      margin-top: 12px;
+    }}
+
   </style>
 </head>
 
@@ -1149,7 +1157,7 @@ def index(
 
         <div class="tiny">※URLを入れると料理名とカテゴリ候補を出すよ（外れたらタップで変更）</div>
 
-        <button type="submit" class="sheetSave">保存する ✨</button>
+        <button type="submit" class="sheetSave stickySave">保存する ✨</button>
       </form>
     </div>
   </div>
