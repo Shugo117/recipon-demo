@@ -52,8 +52,6 @@ CATEGORIES: List[Dict[str, str]] = [
     {"key": "おかず", "emoji": "🥗"},
     {"key": "サラダ", "emoji": "🥬"},
     {"key": "スープ", "emoji": "🍲"},
-
-    {"key": "お弁当", "emoji": "🍱"},
    
     {"key": "おつまみ", "emoji": "🍺"},
     {"key": "スイーツ", "emoji": "🍰"},
