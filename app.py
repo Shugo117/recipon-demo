@@ -17,6 +17,8 @@ import json
 from database import SessionLocal, engine, Base
 from models import RecipeLink
 from ai_dish import needs_ai, ai_refine_dish_name
+from ai_category import needs_ai_category, ai_suggest_categories
+
 
 # =========================
 # App
@@ -33,10 +35,12 @@ STATIC_DIR.mkdir(exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
 # Chrome devtoolsが勝手に叩くやつ（404が気になるなら黙らせる）
 @app.get("/.well-known/appspecific/com.chrome.devtools.json")
 def chrome_devtools_dummy():
     return JSONResponse({})
+
 
 # =========================
 # 固定カテゴリ（かわいい寄せ）
@@ -52,7 +56,6 @@ CATEGORIES: List[Dict[str, str]] = [
     {"key": "おかず", "emoji": "🥗"},
     {"key": "サラダ", "emoji": "🥬"},
     {"key": "スープ", "emoji": "🍲"},
-   
     {"key": "おつまみ", "emoji": "🍺"},
     {"key": "スイーツ", "emoji": "🍰"},
     {"key": "おやつ", "emoji": "🍪"},
@@ -91,6 +94,26 @@ def h(s: str) -> str:
 
 def normalize_spaces(s: str) -> str:
     return (s or "").replace("　", " ").strip()
+
+def canonicalize_cookpad_url(url: str) -> str:
+    url = normalize_spaces(url)
+    if not url:
+        return url
+
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+
+        # cookpad以外はそのまま
+        if "cookpad." not in host:
+            return url
+
+        # クエリ・フラグメント全部削除（cookpadは安全）
+        p = p._replace(query="", fragment="")
+        return p.geturl()
+
+    except Exception:
+        return url
 
 
 def q(s: str) -> str:
@@ -136,7 +159,7 @@ def _is_safe_public_http_url(url: str) -> bool:
 # =========================
 # OGP image
 # =========================
-@lru_cache(maxsize=512)
+#@lru_cache(maxsize=512)
 def get_og_image(page_url: str) -> Optional[str]:
     if not page_url:
         return None
@@ -152,53 +175,91 @@ def get_og_image(page_url: str) -> Optional[str]:
                 "Accept": "text/html,application/xhtml+xml",
             },
         )
-        with urllib.request.urlopen(req, timeout=3) as res:
+        with urllib.request.urlopen(req, timeout=5) as res:
             ctype = (res.headers.get("Content-Type") or "").lower()
             if "text/html" not in ctype:
                 return None
-            raw = res.read(220_000)
+            raw = res.read(300_000)
             html = raw.decode("utf-8", errors="ignore")
 
-        m = re.search(
+        candidates: List[str] = []
+
+        def add(u: Optional[str]):
+            if not u:
+                return
+            u = u.strip()
+            if not u:
+                return
+            u = urljoin(page_url, u)
+            if u.startswith(("http://", "https://")):
+                candidates.append(u)
+
+        # 1) JSON-LD Recipe.image
+        add(extract_recipe_image_from_jsonld(html))
+
+        # 2) og:image / twitter:image
+        for pat in [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            html,
-            flags=re.IGNORECASE,
-        )
-        if not m:
-            m = re.search(
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-                html,
-                flags=re.IGNORECASE,
-            )
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+            r'<meta[^>]+itemprop=["\']image["\'][^>]+content=["\']([^"\']+)["\']',
+        ]:
+            m = re.search(pat, html, flags=re.IGNORECASE)
+            if m:
+                add(m.group(1))
 
-        if not m:
-            m = re.search(
-                r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
-                html,
-                flags=re.IGNORECASE,
-            )
-            if not m:
-                m = re.search(
-                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
-                    html,
-                    flags=re.IGNORECASE,
-                )
+        # 3) それでも足りない時の保険：imgタグ（大きい料理画像がここにいることがある）
+        #    ※無限に拾うと重いから、先頭だけ薄く拾う
+        for m in re.finditer(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+            add(m.group(1))
+            if len(candidates) >= 12:
+                break
 
-        if not m:
+        # ---- Cookpad用フィルタ ----
+        host = (urlparse(page_url).hostname or "").lower()
+        is_cookpad = "cookpad" in host
+
+        def looks_like_banner(u: str) -> bool:
+            lu = u.lower()
+            # “カード画像/共有用OGP”によく出る語
+            bad_words = ["ogp", "share", "card", "twitter", "twimg", "summary", "logo"]
+            return any(w in lu for w in bad_words)
+
+        def looks_like_photo(u: str) -> bool:
+            lu = u.lower()
+            # 料理写真っぽい（Cookpad CDNの実体っぽい）語を優先
+            good_words = ["img.cpcdn.com", "/recipe/", "/recipes/", "/recipe_images/", "photos"]
+            return any(w in lu for w in good_words)
+
+        # 候補の重複除去（順序維持）
+        uniq: List[str] = []
+        seen = set()
+        for u in candidates:
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+
+        if not uniq:
             return None
 
-        img = (m.group(1) or "").strip()
-        if not img:
-            return None
+        if is_cookpad:
+            # 料理写真っぽいものを最優先
+            for u in uniq:
+                if looks_like_photo(u) and not looks_like_banner(u):
+                    return u
+            # バナーっぽくないものを次点
+            for u in uniq:
+                if not looks_like_banner(u):
+                    return u
+            # 最後の最後：諦めて最初
+            return uniq[0]
 
-        img = urljoin(page_url, img)
-        if not img.startswith(("http://", "https://")):
-            return None
-        return img
+        # Cookpad以外は今まで通り “最初に取れたまともなの”
+        return uniq[0]
 
     except Exception:
         return None
-
 
 # =========================
 # Dish name extraction helpers
@@ -213,6 +274,7 @@ _SPLIT_SEP_RE = re.compile(r"\s*(?:[｜|]|[-–—])\s*")
 _TAIL_RE = re.compile(
     r"\s*(?:by\s+\S+|By\s+\S+|\([^)]{1,40}\)|（[^）]{1,40}）)\s*$"
 )
+
 
 def clean_dish_title(raw: str) -> Optional[str]:
     if not raw:
@@ -229,7 +291,7 @@ def clean_dish_title(raw: str) -> Optional[str]:
 
     # 長すぎる場合だけ分割を使う
     if parts and len(parts[0]) >= 3:
-      s = parts[0].strip()
+        s = parts[0].strip()
 
     # 末尾の括弧系を軽く複数回落とす（ただし # は残したいのでここでは触らない）
     for _ in range(2):
@@ -248,16 +310,13 @@ def clean_dish_title(raw: str) -> Optional[str]:
 
         body = (m.group(3) or "").strip()
 
-        # 宣伝・サイト寄り → 落とす
         promo_words = [
-          "人気", "おすすめ", "殿堂", "話題", "失敗なし", "公式",
-          "人気レシピ", "鉄板", "保存版", "ランキング", "1位", "No.1"
+            "人気", "おすすめ", "殿堂", "話題", "失敗なし", "公式",
+            "人気レシピ", "鉄板", "保存版", "ランキング", "1位", "No.1"
         ]
-        # 宣伝・サイト寄り → 落とす（ただし短い情報は残す）
         if any(w in body for w in promo_words) and len(body) >= 15:
-          return (m.group(1) or "").strip()
+            return (m.group(1) or "").strip()
 
-        # 調理情報（残したい）→ 残す
         keep_words = [
             "レンジ", "電子レンジ", "フライパン", "鍋", "炊飯器", "トースター",
             "めんつゆ", "時短", "とろみ", "不要", "作り置き", "お弁当"
@@ -265,38 +324,27 @@ def clean_dish_title(raw: str) -> Optional[str]:
         if any(w in body for w in keep_words):
             return text
 
-        # どっちとも言えない【...】は一旦残す（削りすぎ防止）
         return text
 
-    # 最大2回（【】【】みたいな連結対策）
     for _ in range(2):
         ns = _strip_bracket_tail_by_policy(s)
         if ns == s:
             break
         s = ns
 
-    # よくある語尾・語頭を落とす
     s = re.sub(r"レシピ$", "", s).strip()
     s = re.sub(r"^レシピ[:：]?\s*", "", s).strip()
     s = re.sub(r"作り方$", "", s).strip()
     s = re.sub(r"^作り方[:：]?\s*", "", s).strip()
 
-    # ノイズワード（先頭/末尾だけ）を落とす
     for w in _NOISE_WORDS:
         s = re.sub(rf"^{re.escape(w)}\s*", "", s).strip()
         s = re.sub(rf"\s*{re.escape(w)}$", "", s).strip()
 
-    # 末尾に付きがちな敬称だけ削る（タイトル要素は残す）
     s = re.sub(r"\s+(さん|ちゃん|くん|氏)$", "", s).strip()
-
-    # 記号整理（#は残したいので削らない）
     s = s.strip(" -–—|｜:：/／").strip()
 
-    # -------------------------
-    # 安全弁：削りすぎたら戻す
-    # -------------------------
     if len(s) < 2:
-        # 元の候補から最低限だけ整えて返す
         fallback = s0.strip().strip(" -–—|｜:：/／").strip()
         return fallback if (2 <= len(fallback) <= 80) else None
 
@@ -305,8 +353,65 @@ def clean_dish_title(raw: str) -> Optional[str]:
     return s[:80].strip() if s else None
 
 
+
+def extract_recipe_image_from_jsonld(html: str) -> Optional[str]:
+    if not html:
+        return None
+
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        blob = (m.group(1) or "").strip()
+        if not blob:
+            continue
+        try:
+            data = json.loads(blob)
+        except Exception:
+            continue
+
+        candidates: List[dict] = []
+        if isinstance(data, dict):
+            candidates.append(data)
+            g = data.get("@graph")
+            if isinstance(g, list):
+                candidates.extend([x for x in g if isinstance(x, dict)])
+        elif isinstance(data, list):
+            candidates.extend([x for x in data if isinstance(x, dict)])
+
+        for obj in candidates:
+            t = obj.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if not any(isinstance(x, str) and x == "Recipe" for x in types):
+                continue
+
+            img = obj.get("image")
+            urls: List[str] = []
+
+            if isinstance(img, str):
+                urls.append(img)
+            elif isinstance(img, list):
+                for it in img:
+                    if isinstance(it, str):
+                        urls.append(it)
+                    elif isinstance(it, dict):
+                        u = it.get("url")
+                        if isinstance(u, str):
+                            urls.append(u)
+            elif isinstance(img, dict):
+                u = img.get("url")
+                if isinstance(u, str):
+                    urls.append(u)
+
+            for u in urls:
+                u = (u or "").strip()
+                if u.startswith(("http://", "https://")):
+                    return u
+
+    return None
+
 def extract_recipe_name_from_jsonld(html: str) -> Optional[str]:
-    # <script type="application/ld+json"> ... </script> を全部拾う
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
@@ -339,11 +444,8 @@ def extract_recipe_name_from_jsonld(html: str) -> Optional[str]:
 
     return None
 
+
 def extract_h1_title(html: str) -> Optional[str]:
-    """
-    ページ上部の太字タイトル（だいたいH1）を抜く。
-    タグや改行を潰して文字だけにする。
-    """
     if not html:
         return None
 
@@ -352,10 +454,14 @@ def extract_h1_title(html: str) -> Optional[str]:
         return None
 
     t = m.group(1) or ""
-    # H1内のタグ除去
     t = re.sub(r"<[^>]+>", "", t)
-    # HTMLエンティティの最低限（必要なら増やす）
-    t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    t = (
+        t.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
     t = re.sub(r"\s+", " ", t).strip()
 
     if 2 <= len(t) <= 120:
@@ -364,7 +470,6 @@ def extract_h1_title(html: str) -> Optional[str]:
 
 
 def extract_og_or_title(html: str) -> Optional[str]:
-    # og:title
     m = re.search(
         r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
         html,
@@ -377,7 +482,6 @@ def extract_og_or_title(html: str) -> Optional[str]:
             flags=re.IGNORECASE,
         )
 
-    # twitter:title
     if not m:
         m = re.search(
             r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
@@ -396,7 +500,6 @@ def extract_og_or_title(html: str) -> Optional[str]:
         if t:
             return t
 
-    # <title>
     mt = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     if mt:
         t = re.sub(r"\s+", " ", (mt.group(1) or "").strip())
@@ -406,9 +509,6 @@ def extract_og_or_title(html: str) -> Optional[str]:
     return None
 
 
-# =========================
-# Dish name (JSON-LD -> og:title -> <title>)
-# =========================
 def get_og_title(page_url: str) -> Optional[str]:
     if not page_url:
         return None
@@ -431,23 +531,18 @@ def get_og_title(page_url: str) -> Optional[str]:
             raw = res.read(240_000)
             html = raw.decode("utf-8", errors="ignore")
 
-        # 1) JSON-LD (Recipe.name)
         title = extract_recipe_name_from_jsonld(html)
 
-        # 2) H1（画面の太字タイトルを優先）
         if not title:
             title = extract_h1_title(html)
 
-        # 3) OGP / twitter / <title>
         if not title:
             title = extract_og_or_title(html)
 
-        # 4) Clean（削りすぎ防止あり）
         cleaned = clean_dish_title(title or "")
         if cleaned:
             return cleaned
 
-        # 5) fallback（空になるのを防ぐ）
         fallback = (title or "").strip()
         if 2 <= len(fallback) <= 120:
             return fallback
@@ -518,7 +613,14 @@ def guess_category_from_text(text: str) -> str:
 def meta(url: str = Query(...)):
     title = get_og_title(url)
     suggested = guess_category_from_text(title or "")
-    return JSONResponse({"title": title, "category": suggested})
+
+    ai = None
+    if needs_ai_category(title):
+        keys = [c["key"] for c in CATEGORIES]
+        ai = ai_suggest_categories(title or "", keys, top_k=3)
+
+    return JSONResponse({"title": title, "category": suggested, "ai": ai})
+
 
 # =========================
 # UI
@@ -533,7 +635,7 @@ def index(
     edit_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    print("### INDEX HIT / app.py version = 2026-02-20-JSONLD-CLEAN-TITLE-PWA ###")
+    print("### INDEX HIT / app.py version = 2026-02-27-THUMB-STABLE-NO-ZOOM ###")
 
     filter_category = normalize_category(category) if category else None
     if category and filter_category == "その他" and category not in CATEGORY_KEYS:
@@ -587,16 +689,29 @@ def index(
     cards = []
     for it in items:
         og_img = get_og_image(it.url)
-        zoom_cls = ""
-        if og_img and ("kikkoman" in og_img.lower() or "kikkoman" in (it.url or "").lower()):
-            zoom_cls = " zoom"
+        thumb_a_cls = "thumb"
+        if og_img and ("cookpad" in (og_img or "").lower() or "cookpad" in (it.url or "").lower()):
+            thumb_a_cls += " cookpad"
 
         if og_img:
-            thumb = f"<img class='thumbimg{zoom_cls}' src='{h(og_img)}' alt=''>"
+            cls = "thumbimg"
+            og_lower = og_img.lower()
+            url_lower = (it.url or "").lower()
+
+            if "kikkoman" in og_lower or "kikkoman" in url_lower:
+                cls += " zoom"
+
+            if "cookpad" in og_lower or "cookpad" in url_lower:
+                cls += " cookpad"
+
+                # CookpadのOGP画像は「左に写真＋右にロゴ/文字」のカード率が高いので
+                # URLに特徴語がなくても強めにcookpadcard扱いにする（表示の安定優先）
+                cls += " cookpadcard"
+
+            thumb = f"<img class='{cls}' src='{h(og_img)}' data-src='{h(og_img)}' alt='' loading='lazy' decoding='async'>"
         else:
             thumb = "<div class='thumbph'>🍓</div>"
 
-        # 編集UIはスマホでは要らないので出さない（残すならedit_idで表示、ただしdisplay:none）
         edit_block = ""
         if edit_id == it.id:
             edit_block = f"""
@@ -627,7 +742,7 @@ def index(
         cards.append(
             f"""
         <div class="card" tabindex="0" data-id="{it.id}" data-filter="{h(filter_category or '')}">
-          <a class="thumb" href="{h(it.url)}" target="_blank" rel="noreferrer">
+          <a class="{thumb_a_cls}" href="{h(it.url)}" target="_blank" rel="noreferrer">
             {thumb}
           </a>
           <div class="cardpad">
@@ -684,7 +799,7 @@ def index(
     .wrap {{
       max-width: 430px;
       margin: 0 auto;
-      padding: 22px 14px 110px;  /* ← 14px → 22px に増やす */
+      padding: 22px 14px 110px;
     }}
 
     input, select, button {{ font-size: 16px; }}
@@ -795,22 +910,43 @@ def index(
     }}
 
     .thumb {{
-      display:block;
-      width:100%;
+      display: block;
+      width: 100%;
       aspect-ratio: 4 / 5;
       background: linear-gradient(135deg, rgba(255,95,162,.12), rgba(74,163,255,.12));
-      text-decoration:none;
-      overflow:hidden;
+      text-decoration: none;
+      overflow: hidden;
+      position: relative;
     }}
+
+        /* ---- Thumb image (base) ---- */
     .thumbimg {{
-      width:100%;
-      height:100%;
+      width: 100%;
+      height: 100%;
+      display: block;
       object-fit: cover;
-      display:block;
-      transform: scale(1.00);
-      transition: transform .15s ease;
+      object-position: center;
     }}
-    .thumbimg.zoom {{ transform: scale(1.35); }}
+
+    /* ---- cookpad専用（カード画像は左側＝料理写真側に寄せて見せる） ---- */
+    .thumb.cookpad {{
+      background: #fff;
+    }}
+
+    .thumbimg.cookpad {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: cover;              /* ★containをやめる（右側の文字を切る） */
+      object-position: center;
+    }}
+
+    .thumbimg.cookpadcard {{
+      object-position: 12% 50%;
+      transform: scale(1.40);
+      transform-origin: 12% 50%;
+    }}
+    
 
     .thumbph {{
       width:100%;
@@ -987,6 +1123,31 @@ def index(
       margin-top: -2px;
     }}
 
+    .aihint {{
+      margin-top: 8px;
+      padding: 12px 12px;
+      border-radius: 14px;
+      border: 2px solid rgba(255,95,162,.55);
+      background: linear-gradient(135deg, rgba(255,95,162,.18), rgba(74,163,255,.12));
+      font-size: 13px;
+      font-weight: 900;
+      color: #ff4da6;
+      line-height: 1.4;
+    }}
+
+    .aihint strong {{
+      display: block;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }}
+
+    .aihint.off {{
+      border: 1px dashed rgba(31,36,48,.15);
+      background: rgba(255,255,255,.7);
+      color: var(--muted);
+      font-weight: 600;
+    }}
+
     .sheetSave {{
       width: 100%;
       border: none;
@@ -1095,7 +1256,6 @@ def index(
       z-index: 10;
       margin-top: 12px;
     }}
-
   </style>
 </head>
 
@@ -1153,7 +1313,7 @@ def index(
           </div>
         </label>
 
-        <div class="tiny">※URLを入れると料理名とカテゴリ候補を出すよ（外れたらタップで変更）</div>
+        <div class="aihint off" id="aiHint">※AIカテゴリ判定は一部のレシピで動きます</div>
 
         <button type="submit" class="sheetSave stickySave">保存する ✨</button>
       </form>
@@ -1166,12 +1326,44 @@ def index(
       navigator.serviceWorker.register("/static/sw.js").catch(() => {{}});
     }}
 
+    // ---- Thumb: small image auto-detect (no AI) ----
+    // 小さいOGP画像/バナー系は cover だと事故りやすいので contain に切替
+        function applyCookpadBlurBg() {{
+      const links = document.querySelectorAll(".thumb.cookpad");
+      links.forEach((a) => {{
+        const img = a.querySelector("img.thumbimg.cookpad");
+        if (!img) return;
+
+        if (a.querySelector(".blurbg")) return;
+
+        const src = img.getAttribute("data-src") || img.getAttribute("src");
+        if (!src) return;
+
+        const bg = document.createElement("div");
+        bg.className = "blurbg";
+        bg.style.backgroundImage = `url("${{src}}")`;
+        a.prepend(bg);
+      }});
+    }}
+
+    // ---- Thumb fallback: 画像が404/403などで死んだらプレースホルダー ----
+    window.addEventListener("load", () => {{
+      document.querySelectorAll("img.thumbimg").forEach((img) => {{
+        img.addEventListener("error", () => {{
+          const a = img.closest("a.thumb");
+          if (!a) return;
+          a.innerHTML = "<div class='thumbph'>🍓</div>";
+        }}, {{ once: true }});
+      }});
+    }});
+    
+
+
     const fab = document.getElementById("fab");
     const sheet = document.getElementById("sheet");
     const closeBtn = document.getElementById("sheetClose");
     const urlInput = document.getElementById("urlInput");
     const dishInput = document.getElementById("dishInput");
-
     const clearBtn = document.getElementById("clearBtn");
 
     if (clearBtn) {{
@@ -1261,6 +1453,24 @@ def index(
         if (data && data.category) {{
           if (!userTouchedCategory) {{
             setCategory(data.category, false);
+          }}
+        }}
+
+        // ---- AI候補ヒント表示（表示だけ） ----
+        const aiHint = document.getElementById("aiHint");
+        if (aiHint) {{
+          if (data && data.ai && data.ai.candidates && data.ai.candidates.length) {{
+            const c = data.ai.candidates.join(" / ");
+            const r = (data.ai.reason ? data.ai.reason : "");
+
+            aiHint.classList.remove("off");
+            aiHint.innerHTML =
+              "<strong>🤖 AIがカテゴリ候補を判定</strong>" +
+              "<div>候補: " + c + "</div>" +
+              (r ? "<div>理由: " + r + "</div>" : "");
+          }} else {{
+            aiHint.classList.add("off");
+            aiHint.textContent = "※AIカテゴリ判定は一部のレシピで動きます";
           }}
         }}
       }} catch (e) {{
@@ -1418,7 +1628,7 @@ def add(
     category: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    url = normalize_spaces(url)
+    url = canonicalize_cookpad_url(url)
     title = normalize_spaces(title)
     category = normalize_category(category)
 
