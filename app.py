@@ -612,14 +612,28 @@ def guess_category_from_text(text: str) -> str:
 @app.get("/meta")
 def meta(url: str = Query(...)):
     title = get_og_title(url)
+
+    # 通常のカテゴリ推定（正規表現など）
     suggested = guess_category_from_text(title or "")
 
-    ai = None
-    if needs_ai_category(title):
-        keys = [c["key"] for c in CATEGORIES]
-        ai = ai_suggest_categories(title or "", keys, top_k=3)
+    data = {}
 
-    return JSONResponse({"title": title, "category": suggested, "ai": ai})
+    if title:
+        data["title"] = title
+
+    if suggested:
+        data["category"] = suggested
+
+    # ===== AI判定（条件付き） =====
+    if title and needs_ai_category(title):
+        keys = [c["key"] for c in CATEGORIES]
+        ai = ai_suggest_categories(title, keys, top_k=3)
+
+        # Noneじゃない時だけ返す（ここ重要）
+        if ai:
+            data["ai"] = ai
+
+    return JSONResponse(data)
 
 
 # =========================

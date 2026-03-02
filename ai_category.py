@@ -4,8 +4,12 @@ from typing import Optional, List, Dict
 
 from openai import OpenAI
 
+# ===== OpenAI client (optional) =====
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+client = None
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def needs_ai_category(title: Optional[str]) -> bool:
@@ -13,13 +17,27 @@ def needs_ai_category(title: Optional[str]) -> bool:
     if not t:
         return False
 
-    # 「ボール」「ボウル」だけAI判定
+    # 「ボール」「ボウル」だけAI判定（ポートフォリオ用の見せ場）
     return ("ボウル" in t) or ("ボール" in t)
 
 
-def ai_suggest_categories(title: str, category_keys: List[str], top_k: int = 3) -> Optional[Dict[str, object]]:
+def ai_suggest_categories(
+    title: str,
+    category_keys: List[str],
+    top_k: int = 3
+) -> Optional[Dict[str, object]]:
     if not title:
         return None
+
+    # Render等でキー未設定ならAIは使わずスキップ（起動落ち防止）
+    if client is None:
+        return None
+
+    # 変な引数が来ても安全側に倒す
+    if not category_keys:
+        return None
+    if top_k <= 0:
+        top_k = 3
 
     prompt = f"""あなたはレシピ分類アシスタントです。
 次の料理名を、与えられたカテゴリの中から最も適切な候補を最大{top_k}個選んでください。
