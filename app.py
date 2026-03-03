@@ -159,7 +159,7 @@ def _is_safe_public_http_url(url: str) -> bool:
 # =========================
 # OGP image
 # =========================
-#@lru_cache(maxsize=512)
+@lru_cache(maxsize=512)
 def get_og_image(page_url: str) -> Optional[str]:
     if not page_url:
         return None
@@ -625,16 +625,30 @@ def meta(url: str = Query(...)):
         data["category"] = suggested
 
     # ===== AI判定（条件付き） =====
-    if title and needs_ai_category(title):
-        keys = [c["key"] for c in CATEGORIES]
-        ai = ai_suggest_categories(title, keys, top_k=3)
+    needs_ai = bool(title) and needs_ai_category(title)
+    has_key = bool(os.environ.get("OPENAI_API_KEY"))
 
-        # Noneじゃない時だけ返す（ここ重要）
-        if ai:
-            data["ai"] = ai
+    ai = None
+    ai_error = None
+
+    if needs_ai and has_key:
+        try:
+            keys = [c["key"] for c in CATEGORIES]
+            ai = ai_suggest_categories(title, keys, top_k=3)
+        except Exception as e:
+            ai_error = str(e)
+
+    # ★ここがポイント：Noneでも返す（原因確認のため）
+    data["ai"] = ai
+
+    # ★原因が見える化される
+    data["debug"] = {
+        "needs_ai": needs_ai,
+        "has_openai_key": has_key,
+        "ai_error": ai_error,
+    }
 
     return JSONResponse(data)
-
 
 # =========================
 # UI
