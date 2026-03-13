@@ -9,7 +9,7 @@
 
 ## デモ / リンク
 
-- App（Render）：https://recipon.onrender.com/
+- App（Render）：https://recipon-demo.onrender.com/
 - GitHub：https://github.com/Shugo117/recipon
 
 ---
